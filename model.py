@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
+from safetensors.torch import load_file, save_file
 
 import torch
 from torch import nn
@@ -493,10 +494,19 @@ class MLA(nn.Module):
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
+        self.use_attention_gate = args.use_attention_gate
 
         self.wq_a = Linear(self.dim, self.q_lora_rank)
         self.q_norm = RMSNorm(self.q_lora_rank)
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+
+        if self.use_attention_gate: 
+            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim + self.n_heads * self.v_head_dim)
+            self.gate_dim = self.v_head_dim
+
+        else:
+            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+            self.gate_dim = 0
+
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
@@ -527,7 +537,22 @@ class MLA(nn.Module):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr)
+        q_out = self.wq_b(qr)
+        
+        # Split query and gate if using gated attention
+        if self.use_attention_gate:
+            # Calculate the split sizes for local heads (after column parallel)
+            local_q_dim = self.n_local_heads * self.qk_head_dim
+            local_gate_dim = self.n_local_heads * self.gate_dim
+            
+            # Split the output into query states and gate scores
+            q, gate_score = torch.split(q_out, [local_q_dim, local_gate_dim], dim=-1)
+            gate_score = gate_score.view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
+        
+        else:
+            q = q_out
+            gate_score = None
+
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
@@ -555,7 +580,8 @@ class MLA(nn.Module):
             scores += index_mask.unsqueeze(2)
 
             scores = scores.softmax(dim=-1)
-            x = torch.einsum("bsht,bthd->bshd", scores, v)
+            attn_output = torch.einsum("bsht,bthd->bshd", scores, v)
+            if self.use_attention_gate and gate_score is not None: attn_output = attn_output * torch.sigmoid(gate_score)
         else:                   # MQA decode
             if self.dequant_wkv_b is None and self.wkv_b.scale is not None:
                 self.dequant_wkv_b = weight_dequant(self.wkv_b.weight, self.wkv_b.scale)
@@ -571,9 +597,10 @@ class MLA(nn.Module):
             scores += index_mask.unsqueeze(2)
 
             scores = scores.softmax(dim=-1)
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
-        x = self.wo(x.flatten(2))
+            attn_output = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            attn_output = torch.einsum("bshc,hdc->bshd", attn_output, wkv_b[:, -self.v_head_dim:])
+            if self.use_attention_gate and gate_score is not None: attn_output = attn_output * torch.sigmoid(gate_score)
+        x = self.wo(attn_output.flatten(2))
         return x
 
 
