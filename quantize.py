@@ -18,8 +18,10 @@ DATASET_SPLIT = "train"
 NUM_CALIBRATION_SAMPLES = 512
 MAX_SEQUENCE_LENGTH = 2048
 
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 ds = ds.shuffle(seed=42)
+ds = ds.filter(lambda x: len(x["text"]) > 100)
+ds = ds.select(range(NUM_CALIBRATION_SAMPLES))
 
 def preprocess(example):
     text = ""
@@ -32,8 +34,6 @@ def preprocess(example):
             text += f"Assistant: {content}\n\n"
     return {"text": text}
 
-ds = ds.map(preprocess)
-
 def tokenize(sample):
     return tokenizer(
         sample["text"],
@@ -45,17 +45,14 @@ def tokenize(sample):
 
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
-recipe = [
-    SpinQuantModifier(rotations=["R3"]),
-    QuantizationModifier(
-        config_groups={
-            "all_linears": QuantizationScheme(
-                targets=["Linear"],
-                input_activations=NVFP4["input_activations"],
-            ),
-        }
-    ),
-]
+recipe = QuantizationModifier(
+    config_groups={
+        "all_linears": QuantizationScheme(
+            targets=["Linear"],
+            input_activations=NVFP4["input_activations"],
+        ),
+    }
+)
 
 oneshot(
     model=model,
