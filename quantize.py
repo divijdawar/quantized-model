@@ -15,7 +15,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 DATASET_ID = "GAIR/LIMI"
 DATASET_SPLIT = "train"
 
-NUM_CALIBRATION_SAMPLES = 512
+NUM_CALIBRATION_SAMPLES = 128
 MAX_SEQUENCE_LENGTH = 2048
 
 ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
